@@ -2,25 +2,20 @@
 """
 Face Recognition Web Application (FastAPI + HTML5/JavaScript)
 --------------------------------------------------------------
-Features:
-- Self-contained web app with HTML5 getUserMedia browser camera.
-- Robust template loading: supports templates/index.html, root index.html,
-  and embedded fallback.
-- Wide CORS support for cross-origin mobile/desktop requests.
-- Modern FastAPI Lifespan startup to avoid deprecated event warnings.
+Clean, lightweight server that automatically serves index.html
+from root or templates/ folder, processes frames, and matches faces.
 """
 
 import os
-import io
 import re
 import base64
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -39,457 +34,246 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KNOWN_FACES_DIR = os.path.join(BASE_DIR, "known_faces")
 os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
 
-# In-memory storage for known face encodings and names
 known_face_encodings: List[np.ndarray] = []
 known_face_names: List[str] = []
-TOLERANCE = 0.55  # Distance threshold: lower = stricter matching
+TOLERANCE = 0.55
 
-EMBEDDED_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Face Recognition AI - Live Camera</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-  <style>
-    .video-container {
-      position: relative;
-      width: 100%;
-      max-width: 640px;
-      aspect-ratio: 4 / 3;
-      background-color: #0f172a;
-      border-radius: 0.75rem;
-      overflow: hidden;
-      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.4);
-    }
-    video {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-    canvas#overlay {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-    }
-    .pulse-ring {
-      animation: pulse-border 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-    }
-    @keyframes pulse-border {
-      0%, 100% { border-color: rgba(34, 197, 94, 0.8); }
-      50% { border-color: rgba(34, 197, 94, 0.2); }
-    }
-  </style>
-</head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans">
 
-  <!-- Header -->
-  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
-    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
-      <div class="flex items-center space-x-3">
-        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
-          <i class="fa-solid fa-id-card-clip text-white text-lg"></i>
-        </div>
-        <div>
-          <h1 class="text-lg font-bold text-white tracking-tight">Face Recognition System</h1>
-          <p class="text-xs text-slate-400">Browser Camera &middot; FastAPI &middot; 128-d AI Encodings</p>
-        </div>
-      </div>
-      <div class="flex items-center space-x-3">
-        <span id="backend-status" class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-          <span class="w-2 h-2 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span> Backend Connected
-        </span>
-      </div>
-    </div>
-  </header>
+def load_known_faces() -> int:
+    global known_face_encodings, known_face_names
+    if face_recognition is None:
+        return 0
 
-  <!-- Main Content Grid -->
-  <main class="max-w-6xl mx-auto px-4 py-6 flex-1 w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+    encodings = []
+    names = []
+    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
 
-    <!-- Left Column: Camera Feed & Real-Time Controls (7 cols) -->
-    <div class="lg:col-span-7 flex flex-col space-y-4">
-      
-      <!-- Video Viewport -->
-      <div class="video-container relative mx-auto border-2 border-slate-800" id="videoBox">
-        <video id="video" playsinline autoplay muted></video>
-        <canvas id="overlay"></canvas>
-        <canvas id="captureCanvas" class="hidden"></canvas>
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in valid_exts:
+            continue
 
-        <!-- Placeholder when camera is inactive -->
-        <div id="cameraPlaceholder" class="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-900">
-          <div class="w-16 h-16 rounded-full bg-slate-800 flex items-center justify-center mb-3 text-slate-400">
-            <i class="fa-solid fa-camera text-2xl"></i>
-          </div>
-          <h3 class="text-base font-semibold text-slate-200">Camera Access Chalu Karein</h3>
-          <p class="text-xs text-slate-400 mt-1 max-w-xs">
-            "Start Camera" button dabayein taaki browser aapke phone ya PC camera ko access kar sake.
-          </p>
-          <button id="startCamBtn" onclick="toggleCamera()" class="mt-4 px-5 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-medium text-sm transition flex items-center space-x-2 shadow-lg shadow-cyan-600/30">
-            <i class="fa-solid fa-video"></i>
-            <span>Start Camera</span>
-          </button>
-        </div>
+        filepath = os.path.join(KNOWN_FACES_DIR, filename)
+        person_name = os.path.splitext(filename)[0].replace("_", " ").title()
 
-        <!-- Live Status Overlay Banner -->
-        <div id="liveHud" class="absolute top-3 left-3 right-3 hidden flex justify-between items-center px-3 py-1.5 rounded-lg bg-slate-950/80 backdrop-blur border border-slate-800 text-xs text-slate-300">
-          <div class="flex items-center space-x-2">
-            <span class="w-2 h-2 rounded-full bg-red-500 animate-ping"></span>
-            <span class="font-mono uppercase tracking-wider text-[11px] font-semibold text-red-400">LIVE</span>
-          </div>
-          <div id="detectedLabel" class="font-medium text-cyan-300 truncate max-w-[200px]">Scanning for faces...</div>
-          <div id="fpsBadge" class="font-mono text-slate-400">0 FPS</div>
-        </div>
-      </div>
+        try:
+            image = face_recognition.load_image_file(filepath)
+            img_encs = face_recognition.face_encodings(image)
+            if len(img_encs) > 0:
+                encodings.append(img_encs[0])
+                names.append(person_name)
+                logger.info(f"Loaded face: {person_name}")
+        except Exception as e:
+            logger.error(f"Error reading {filename}: {e}")
 
-      <!-- Camera Toolbar -->
-      <div class="flex flex-wrap items-center justify-between gap-2 p-3 bg-slate-900 rounded-xl border border-slate-800">
-        <div class="flex items-center space-x-2">
-          <button id="camToggleBtn" onclick="toggleCamera()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-xs transition flex items-center space-x-2">
-            <i class="fa-solid fa-power-off text-emerald-400"></i>
-            <span id="camToggleText">Camera On</span>
-          </button>
-          <button id="switchCamBtn" onclick="switchCameraFacing()" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs transition" title="Switch Front/Back Camera">
-            <i class="fa-solid fa-camera-rotate"></i>
-          </button>
-        </div>
+    known_face_encodings = encodings
+    known_face_names = names
+    return len(known_face_names)
 
-        <div class="flex items-center space-x-2">
-          <button id="recognizeToggleBtn" onclick="toggleContinuousRecognition()" class="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-medium text-xs transition flex items-center space-x-2 shadow-md shadow-cyan-600/20 disabled:opacity-50" disabled>
-            <i class="fa-solid fa-play"></i>
-            <span id="recognizeBtnText">Start AI Recognition</span>
-          </button>
-        </div>
-      </div>
 
-      <!-- Live Detection Results Card -->
-      <div class="p-4 bg-slate-900 rounded-xl border border-slate-800">
-        <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Live Recognition Results</h3>
-        <div id="resultsList" class="space-y-2">
-          <div class="text-xs text-slate-500 italic">Camera chalu karke 'Start AI Recognition' dabayein.</div>
-        </div>
-      </div>
+def decode_base64_image(image_data: str) -> np.ndarray:
+    if "," in image_data:
+        image_data = image_data.split(",", 1)[1]
 
-    </div>
+    try:
+        binary_data = base64.b64decode(image_data)
+        np_arr = np.frombuffer(binary_data, np.uint8)
+        bgr_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if bgr_image is None:
+            raise ValueError("Failed to decode image")
+        return cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
 
-    <!-- Right Column: Registration & Known Database (5 cols) -->
-    <div class="lg:col-span-5 flex flex-col space-y-6">
 
-      <!-- Face Registration Card -->
-      <div class="p-5 bg-slate-900 rounded-xl border border-slate-800 shadow-sm">
-        <div class="flex items-center space-x-2.5 mb-4">
-          <div class="w-8 h-8 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center border border-emerald-500/20">
-            <i class="fa-solid fa-user-plus text-sm"></i>
-          </div>
-          <div>
-            <h2 class="text-sm font-semibold text-white">Naya Chehra Register Karein</h2>
-            <p class="text-xs text-slate-400">Camera ke samne aakar naam dalein aur snapshot lein.</p>
-          </div>
-        </div>
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_known_faces()
+    yield
 
-        <form id="registerForm" onsubmit="handleRegister(event)" class="space-y-3">
-          <div>
-            <label class="block text-xs font-medium text-slate-300 mb-1">Vyakti ka Naam (Person's Name)</label>
-            <input type="text" id="personNameInput" required placeholder="e.g. Rahul Sharma" class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white placeholder-slate-500 text-xs focus:ring-2 focus:ring-cyan-500 focus:outline-none">
-          </div>
 
-          <button type="submit" id="snapRegisterBtn" class="w-full py-2.5 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs transition flex items-center justify-center space-x-2 shadow-lg shadow-emerald-600/20 disabled:opacity-50" disabled>
-            <i class="fa-solid fa-camera"></i>
-            <span>Take Photo &amp; Save Face</span>
-          </button>
-        </form>
+app = FastAPI(title="Face Recognition API", lifespan=lifespan)
 
-        <div id="registerAlert" class="mt-3 hidden p-2.5 rounded-lg text-xs"></div>
-      </div>
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-      <!-- Known Faces Gallery -->
-      <div class="p-5 bg-slate-900 rounded-xl border border-slate-800 shadow-sm flex-1 flex flex-col">
-        <div class="flex items-center justify-between mb-4">
-          <div class="flex items-center space-x-2">
-            <i class="fa-solid fa-users text-cyan-400 text-sm"></i>
-            <h3 class="text-sm font-semibold text-white">Registered Faces</h3>
-          </div>
-          <button onclick="fetchRegisteredFaces()" class="text-xs text-cyan-400 hover:text-cyan-300 flex items-center space-x-1">
-            <i class="fa-solid fa-rotate-right"></i>
-            <span>Refresh</span>
-          </button>
-        </div>
 
-        <div id="facesGallery" class="space-y-2 overflow-y-auto max-h-72 pr-1">
-          <div class="text-xs text-slate-500">Loading registered faces...</div>
-        </div>
-      </div>
+class RecognizeRequest(BaseModel):
+    image: str
+    tolerance: Optional[float] = 0.55
 
-    </div>
 
-  </main>
+class RegisterRequest(BaseModel):
+    name: str
+    image: str
 
-  <!-- Footer -->
-  <footer class="border-t border-slate-900 py-3 px-4 text-center text-xs text-slate-500">
-    Face Recognition AI Web Platform &bull; Deployable on Render, Docker, or Localhost
-  </footer>
 
-  <!-- Frontend JavaScript Logic -->
-  <script>
-    let stream = null;
-    let isCameraActive = false;
-    let isRecognizing = false;
-    let recognitionInterval = null;
-    let currentFacingMode = "user"; // "user" for front, "environment" for back
-    let frameCount = 0;
-    let lastFpsTime = performance.now();
+@app.get("/", response_class=HTMLResponse)
+async def serve_home():
+    """
+    Checks for index.html in root directory or templates/ folder.
+    """
+    possible_paths = [
+        os.path.join(BASE_DIR, "index.html"),
+        os.path.join(BASE_DIR, "templates", "index.html"),
+        "index.html",
+        "templates/index.html",
+    ]
+    for p in possible_paths:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return HTMLResponse(content=f.read())
+            except Exception as e:
+                logger.error(f"Error reading {p}: {e}")
 
-    const video = document.getElementById("video");
-    const overlay = document.getElementById("overlay");
-    const captureCanvas = document.getElementById("captureCanvas");
-    const placeholder = document.getElementById("cameraPlaceholder");
-    const liveHud = document.getElementById("liveHud");
-    const detectedLabel = document.getElementById("detectedLabel");
-    const fpsBadge = document.getElementById("fpsBadge");
-    const camToggleText = document.getElementById("camToggleText");
-    const recognizeToggleBtn = document.getElementById("recognizeToggleBtn");
-    const recognizeBtnText = document.getElementById("recognizeBtnText");
-    const snapRegisterBtn = document.getElementById("snapRegisterBtn");
-    const resultsList = document.getElementById("resultsList");
-    const facesGallery = document.getElementById("facesGallery");
-    const registerAlert = document.getElementById("registerAlert");
+    return HTMLResponse(
+        "<h2>index.html nahi mila! Kripya GitHub me index.html upload karein.</h2>",
+        status_code=404,
+    )
 
-    // Initialize Registered Faces on Page Load
-    document.addEventListener("DOMContentLoaded", () => {
-      fetchRegisteredFaces();
-    });
 
-    // Toggle Camera On/Off
-    async function toggleCamera() {
-      if (isCameraActive) {
-        stopCamera();
-      } else {
-        await startCamera();
-      }
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "known_faces_count": len(known_face_names),
     }
 
-    // Start Camera using WebRTC getUserMedia
-    async function startCamera() {
-      try {
-        const constraints = {
-          video: {
-            facingMode: currentFacingMode,
-            width: { ideal: 640 },
-            height: { ideal: 480 }
-          },
-          audio: false
-        };
 
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-        video.srcObject = stream;
-        await video.play();
+@app.get("/faces")
+async def list_faces():
+    faces = []
+    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in valid_exts:
+            name = os.path.splitext(filename)[0].replace("_", " ").title()
+            faces.append({"name": name, "filename": filename})
+    return {"success": True, "faces": faces, "total": len(faces)}
 
-        isCameraActive = true;
-        placeholder.classList.add("hidden");
-        liveHud.classList.remove("hidden");
-        camToggleText.innerText = "Camera Off";
-        recognizeToggleBtn.disabled = false;
-        snapRegisterBtn.disabled = false;
 
-        // Resize overlay canvas to match video stream
-        video.onloadedmetadata = () => {
-          overlay.width = video.videoWidth || 640;
-          overlay.height = video.videoHeight || 480;
-          captureCanvas.width = video.videoWidth || 640;
-          captureCanvas.height = video.videoHeight || 480;
-        };
-      } catch (err) {
-        console.error("Camera error:", err);
-        alert("Camera access denied ya camera device nahi mila! Kripya browser me camera permission allow karein.");
-      }
+@app.delete("/faces/{name}")
+async def delete_face(name: str):
+    clean_target = name.strip().replace(" ", "_").lower()
+    deleted = False
+
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        if os.path.splitext(filename)[0].lower() == clean_target:
+            filepath = os.path.join(KNOWN_FACES_DIR, filename)
+            try:
+                os.remove(filepath)
+                deleted = True
+                break
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Person not found")
+
+    load_known_faces()
+    return {"success": True, "message": f"Deleted {name}"}
+
+
+@app.post("/register")
+async def register_face(payload: RegisterRequest):
+    if face_recognition is None:
+        raise HTTPException(status_code=500, detail="face_recognition library missing")
+
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name required")
+
+    rgb_image = decode_base64_image(payload.image)
+    locations = face_recognition.face_locations(rgb_image)
+
+    if len(locations) == 0:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "Koi chehra detect nahi hua."},
+        )
+    elif len(locations) > 1:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "Ek se zyada chehre dikh rahe hain."},
+        )
+
+    clean_filename = f"{re.sub(r'[^a-zA-Z0-9_-]', '_', name.lower())}.jpg"
+    target_path = os.path.join(KNOWN_FACES_DIR, clean_filename)
+
+    bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(target_path, bgr_image)
+    load_known_faces()
+
+    return {
+        "success": True,
+        "message": f"'{name}' register ho gaye!",
+        "filename": clean_filename,
+        "total_known": len(known_face_names),
     }
 
-    // Stop Camera
-    function stopCamera() {
-      if (isRecognizing) {
-        toggleContinuousRecognition();
-      }
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        stream = null;
-      }
-      isCameraActive = false;
-      placeholder.classList.remove("hidden");
-      liveHud.classList.add("hidden");
-      camToggleText.innerText = "Camera On";
-      recognizeToggleBtn.disabled = true;
-      snapRegisterBtn.disabled = true;
 
-      // Clear overlay
-      const ctx = overlay.getContext("2d");
-      ctx.clearRect(0, 0, overlay.width, overlay.height);
-    }
+@app.post("/recognize")
+async def recognize_faces(payload: RecognizeRequest):
+    if face_recognition is None:
+        raise HTTPException(status_code=500, detail="face_recognition library missing")
 
-    // Switch Front and Back camera (for mobile browsers)
-    async function switchCameraFacing() {
-      currentFacingMode = (currentFacingMode === "user") ? "environment" : "user";
-      if (isCameraActive) {
-        stopCamera();
-        await startCamera();
-      }
-    }
+    rgb_image = decode_base64_image(payload.image)
+    h, w = rgb_image.shape[:2]
 
-    // Toggle Continuous AI Face Recognition Loop
-    function toggleContinuousRecognition() {
-      if (!isCameraActive) return;
+    scale = 0.5
+    small_rgb = cv2.resize(rgb_image, (0, 0), fx=scale, fy=scale)
 
-      if (isRecognizing) {
-        clearInterval(recognitionInterval);
-        isRecognizing = false;
-        recognizeToggleBtn.classList.replace("bg-amber-600", "bg-cyan-600");
-        recognizeBtnText.innerText = "Start AI Recognition";
-        detectedLabel.innerText = "Recognition Paused";
-        const ctx = overlay.getContext("2d");
-        ctx.clearRect(0, 0, overlay.width, overlay.height);
-      } else {
-        isRecognizing = true;
-        recognizeToggleBtn.classList.replace("bg-cyan-600", "bg-amber-600");
-        recognizeBtnText.innerText = "Stop Recognition";
-        detectedLabel.innerText = "Scanning live faces...";
+    face_locations = face_recognition.face_locations(small_rgb)
+    if len(face_locations) == 0:
+        return {"success": True, "faces": [], "image_size": {"width": w, "height": h}}
 
-        // Send a frame every 400 milliseconds (~2.5 FPS, optimal for cloud bandwidth & accuracy)
-        recognitionInterval = setInterval(processCurrentFrame, 400);
-      }
-    }
+    face_encodings = face_recognition.face_encodings(small_rgb, face_locations)
+    tol = payload.tolerance or TOLERANCE
+    results = []
 
-    // Capture Frame & Send to /recognize Endpoint
-    async function processCurrentFrame() {
-      if (!isCameraActive || video.readyState !== 4) return;
-
-      const ctx = captureCanvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-      const dataUrl = captureCanvas.toDataURL("image/jpeg", 0.75);
-
-      try {
-        const response = await fetch("/recognize", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ image: dataUrl, tolerance: 0.55 })
-        });
-
-        if (!response.ok) return;
-
-        const data = await response.json();
-        drawBoundingBoxes(data.faces || []);
-        updateResultsList(data.faces || []);
-
-        // Calculate visual FPS
-        frameCount++;
-        const now = performance.now();
-        if (now - lastFpsTime >= 1000) {
-          fpsBadge.innerText = `${frameCount} FPS`;
-          frameCount = 0;
-          lastFpsTime = now;
+    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+        inv = 1.0 / scale
+        orig_box = {
+            "top": int(top * inv),
+            "right": int(right * inv),
+            "bottom": int(bottom * inv),
+            "left": int(left * inv),
+            "width": int((right - left) * inv),
+            "height": int((bottom - top) * inv),
         }
 
-      } catch (err) {
-        console.error("Recognition request error:", err);
-      }
+        name = "Unknown"
+        confidence = 0.0
+
+        if len(known_face_encodings) > 0:
+            distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+            best_idx = int(np.argmin(distances))
+            best_dist = float(distances[best_idx])
+
+            if best_dist <= tol:
+                name = known_face_names[best_idx]
+                confidence = round(max(0.0, min(100.0, (1.0 - (best_dist / tol)) * 100)), 1)
+
+        results.append({
+            "name": name,
+            "confidence": confidence,
+            "box": orig_box,
+        })
+
+    return {
+        "success": True,
+        "faces": results,
+        "total_detected": len(results),
+        "image_size": {"width": w, "height": h},
     }
 
-    // Draw Bounding Boxes on Overlay Canvas
-    function drawBoundingBoxes(faces) {
-      const ctx = overlay.getContext("2d");
-      ctx.clearRect(0, 0, overlay.width, overlay.height);
 
-      if (faces.length === 0) {
-        detectedLabel.innerText = "No face in view";
-        return;
-      }
-
-      faces.forEach(face => {
-        const { top, left, width, height } = face.box;
-        const isKnown = face.name !== "Unknown";
-        const strokeColor = isKnown ? "#22c55e" : "#ef4444";
-        const bannerBg = isKnown ? "rgba(34, 197, 94, 0.9)" : "rgba(239, 68, 68, 0.9)";
-
-        // Box border
-        ctx.strokeStyle = strokeColor;
-        ctx.lineWidth = 3;
-        ctx.strokeRect(left, top, width, height);
-
-        // Label Tag
-        const labelText = isKnown ? `${face.name} (${face.confidence}%)` : "Unknown";
-        ctx.font = "bold 13px sans-serif";
-        const textWidth = ctx.measureText(labelText).width;
-
-        ctx.fillStyle = bannerBg;
-        ctx.fillRect(left, Math.max(0, top - 24), textWidth + 12, 24);
-
-        ctx.fillStyle = "#ffffff";
-        ctx.fillText(labelText, left + 6, Math.max(16, top - 7));
-      });
-
-      const recognizedNames = faces.filter(f => f.name !== "Unknown").map(f => f.name);
-      if (recognizedNames.length > 0) {
-        detectedLabel.innerText = `Recognized: ${recognizedNames.join(", ")}`;
-      } else {
-        detectedLabel.innerText = "Unknown Person";
-      }
-    }
-
-    // Update Results Sidebar
-    function updateResultsList(faces) {
-      if (faces.length === 0) {
-        resultsList.innerHTML = `<div class="text-xs text-slate-500 italic">No faces detected in current frame.</div>`;
-        return;
-      }
-
-      let html = "";
-      faces.forEach(face => {
-        const isKnown = face.name !== "Unknown";
-        html += `
-          <div class="flex items-center justify-between p-2 rounded-lg ${isKnown ? 'bg-emerald-500/10 border border-emerald-500/20' : 'bg-red-500/10 border border-red-500/20'}">
-            <div class="flex items-center space-x-2">
-              <i class="fa-solid ${isKnown ? 'fa-circle-check text-emerald-400' : 'fa-circle-question text-red-400'} text-xs"></i>
-              <span class="text-xs font-semibold ${isKnown ? 'text-emerald-300' : 'text-red-300'}">${face.name}</span>
-            </div>
-            <span class="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-900 text-slate-300">
-              ${isKnown ? `${face.confidence}% Match` : 'No Match'}
-            </span>
-          </div>
-        `;
-      });
-      resultsList.innerHTML = html;
-    }
-
-    // Register a New Face
-    async function handleRegister(e) {
-      e.preventDefault();
-      const nameInput = document.getElementById("personNameInput");
-      const name = nameInput.value.trim();
-
-      if (!name) return;
-      if (!isCameraActive) {
-        alert("Pehle camera chalu karein photo lene ke liye!");
-        return;
-      }
-
-      // Capture snapshot from video
-      const ctx = captureCanvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
-      const dataUrl = captureCanvas.toDataURL("image/jpeg", 0.9);
-
-      snapRegisterBtn.disabled = true;
-      snapRegisterBtn.innerText = "Processing & Saving...";
-
-      try {
-        const response = await fetch("/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: name, image: dataUrl })
-        });
-
-        const result = await response.json();
-        registerAlert.classList.remove("hidden");
-
-        if (response.ok && result.success) {
-          registerAlert.className = "mt-3 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
